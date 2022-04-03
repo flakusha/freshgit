@@ -1,8 +1,8 @@
 mod dl_upd;
 mod git_ops;
-use clap::{Arg, ArgMatches, Command, Parser};
-use dl_upd::{download_repos, update_config, update_directories};
-use log::{error, info, warn};
+use clap::{Arg, Command};
+use dl_upd::{download_repos, update_directories};
+use log::{error, info};
 use simple_logger::SimpleLogger;
 use tokio;
 
@@ -50,23 +50,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .get_matches();
 
+    info!("Checking for subcommands");
     match m.subcommand() {
-        Some(("update", matches)) => {
-            if matches.is_present("update") && matches.is_present("config") {
-                info!("Config found, starting update");
-                update_config(matches);
-                update_directories().await;
-            }
+        Some(("update", _upd)) => {
+            info!("Starting repositories update");
+            update_directories(&m).await;
         }
-        Some(("download", matches)) => {
-            if matches.is_present("download") && matches.is_present("config") {
-                info!("Config found, starting download");
-                update_config(matches);
-                download_repos().await;
-            }
+        Some(("download", _dwl)) => {
+            info!("Starting repositories download");
+            download_repos(&m).await;
         }
         _ => error!("Incorrect configuration and flags provided"),
     }
 
+    info!("Finished successfully");
     Ok(())
 }

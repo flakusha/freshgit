@@ -1,42 +1,57 @@
-use crate::git_ops::{git_clone_repos, git_fetch_repos};
+//! This module is processing Config from .json file to ensure data is valid before passing
+//! it to update(fetch) and download(clone) git functions.
+
+use crate::git_ops::{git_config_and_run, GitMode};
 use clap::ArgMatches;
+use core::fmt;
 use lazy_static::lazy_static;
-use log::{error, info, warn};
+use log::{error, info};
 use serde::Deserialize;
 use serde_json;
 use std::{
+    fmt::Display,
     fs::File,
     io::BufReader,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::RwLock,
 };
 
 lazy_static! {
     pub static ref CONFIG: RwLock<Config> = RwLock::new(Config::default());
 }
 
-pub async fn update_directories() {
-    let conf = get_config().read().unwrap();
-    info!("Config: {:?}", conf);
+/// Config path formatting str
+const CPATH: &str = "Config path:";
+/// Source folder path formatting str
+const SFOLD: &str = "Source folder:";
+/// Files to read formatting str
+const FLTRD: &str = "Files to read:";
+/// Git username formatting str
+const GUSER: &str = "Git username:";
+/// Git password formatting str
+const GPASS: &str = "Git password:";
+/// SSH askpass formatting str
+const SPASS: &str = "SSH askpass:";
+/// Async exec formatting str
+const AEXEC: &str = "Async execution:";
 
-    // Clone values one time to avoid cloning them again
-    // and again inside the loop with async move
-    git_fetch_repos(
-        conf.src_folder.clone().unwrap_or_else(|| PathBuf::new()),
-        Arc::new(conf.git_username.clone().unwrap_or("".to_string())),
-        Arc::new(conf.git_password.clone().unwrap_or("".to_string())),
-        Arc::new(conf.ssh_askpass.clone().unwrap_or("".to_string())),
-    )
-    .await;
+/// Passes actual config data to update/fetch function.
+pub async fn update_directories(matches: &ArgMatches) {
+    update_config(matches);
+    let conf = get_config();
+    info!("Configuration: {}", conf);
+    git_config_and_run(conf, GitMode::FETCH).await;
 }
 
-pub async fn download_repos() {
-    let conf = get_config().read().unwrap();
-    info!("Config: {:?}", conf);
-    git_clone_repos(conf).await;
+/// Passes actual config data to download/clone function.
+pub async fn download_repos(matches: &ArgMatches) {
+    update_config(matches);
+    let conf = get_config();
+    info!("Configuration: {}", conf);
+    git_config_and_run(conf, GitMode::CLONE).await;
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Clone, Debug)]
 pub struct Config {
     pub config_path: Option<PathBuf>,
     pub src_folder: Option<PathBuf>,
@@ -44,6 +59,7 @@ pub struct Config {
     pub git_username: Option<String>,
     pub git_password: Option<String>,
     pub ssh_askpass: Option<String>,
+    pub async_exec: Option<bool>,
 }
 
 impl Default for Config {
@@ -51,20 +67,54 @@ impl Default for Config {
         Self {
             config_path: Some(PathBuf::with_capacity(256)),
             src_folder: Some(PathBuf::with_capacity(256)),
-            files_to_read: Some(Vec::with_capacity(16)),
+            files_to_read: Some(Vec::<PathBuf>::with_capacity(16)),
             git_username: Some(String::with_capacity(16)),
             git_password: Some(String::with_capacity(16)),
             ssh_askpass: Some(String::with_capacity(16)),
+            async_exec: Some(false),
         }
     }
 }
 
-pub fn get_config() -> &'static CONFIG {
-    return &CONFIG;
+impl Display for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}: {:#?} {}: {:#?} {}: {:#?} {}: {} {}: {} {}: {} {}: {}",
+            CPATH,
+            self.config_path.clone().unwrap(),
+            SFOLD,
+            self.src_folder.clone().unwrap(),
+            FLTRD,
+            self.files_to_read.clone().unwrap(),
+            GUSER,
+            self.git_username.clone().unwrap(),
+            GPASS,
+            self.git_password.clone().unwrap(),
+            SPASS,
+            self.ssh_askpass.clone().unwrap(),
+            AEXEC,
+            self.async_exec.clone().unwrap()
+        )
+    }
 }
 
-pub fn update_config(matches: &ArgMatches) {
-    let mut conf = get_config().write().unwrap();
+/// Reads config data and clones it to pass to another functions.
+pub fn get_config() -> Config {
+    let conf = &CONFIG.read().unwrap();
+    Config {
+        config_path: conf.config_path.clone(),
+        src_folder: conf.src_folder.clone(),
+        files_to_read: conf.files_to_read.clone(),
+        git_username: conf.git_username.clone(),
+        git_password: conf.git_password.clone(),
+        ssh_askpass: conf.ssh_askpass.clone(),
+        async_exec: conf.async_exec.clone(),
+    }
+}
+
+fn update_config(matches: &ArgMatches) {
+    let mut conf = get_config();
     conf.config_path = Some(PathBuf::from(matches.value_of("config").unwrap()));
     let uconf = read_config(matches);
     conf.src_folder = uconf.src_folder;
@@ -72,6 +122,7 @@ pub fn update_config(matches: &ArgMatches) {
     conf.git_username = uconf.git_username;
     conf.git_password = uconf.git_password;
     conf.ssh_askpass = uconf.ssh_askpass;
+    conf.async_exec = uconf.async_exec;
 }
 
 fn read_config(matches: &ArgMatches) -> Config {
@@ -85,6 +136,7 @@ fn read_config(matches: &ArgMatches) -> Config {
         git_username: content.git_username,
         git_password: content.git_password,
         ssh_askpass: content.ssh_askpass,
+        async_exec: content.async_exec,
     };
 }
 
