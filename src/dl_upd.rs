@@ -5,7 +5,7 @@ use crate::git_ops::{git_config_and_run, GitMode};
 use clap::ArgMatches;
 use core::fmt;
 use lazy_static::lazy_static;
-use log::{error, info};
+use log::{debug, error, info};
 use serde::Deserialize;
 use serde_json;
 use std::{
@@ -114,15 +114,16 @@ pub fn get_config() -> Config {
 }
 
 fn update_config(matches: &ArgMatches) {
-    let mut conf = get_config();
-    conf.config_path = Some(PathBuf::from(matches.value_of("config").unwrap()));
+    debug!("Unlocking config");
+    let upd = &mut CONFIG.write().unwrap();
+    upd.config_path = Some(PathBuf::from(matches.value_of("config").unwrap()));
     let uconf = read_config(matches);
-    conf.src_folder = uconf.src_folder;
-    conf.files_to_read = uconf.files_to_read;
-    conf.git_username = uconf.git_username;
-    conf.git_password = uconf.git_password;
-    conf.ssh_askpass = uconf.ssh_askpass;
-    conf.async_exec = uconf.async_exec;
+    upd.src_folder = uconf.src_folder;
+    upd.files_to_read = uconf.files_to_read;
+    upd.git_username = uconf.git_username;
+    upd.git_password = uconf.git_password;
+    upd.ssh_askpass = uconf.ssh_askpass;
+    upd.async_exec = uconf.async_exec;
 }
 
 fn read_config(matches: &ArgMatches) -> Config {

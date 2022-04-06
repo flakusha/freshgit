@@ -176,7 +176,15 @@ async fn clone_repos(
 }
 
 async fn git_clone(rp: (Url, PathBuf), gu: Arc<String>, gp: Arc<String>, sa: Arc<String>) {
-    info!("Cloning: {:#?} {:#?}", &rp.0, &rp.1);
+    if rp.1.exists() && rp.1.is_dir() {
+        info!(
+            "Repository is already cloned, use update instead: {}",
+            rp.1.to_str().unwrap_or("error unwrapping")
+        );
+        return;
+    }
+
+    info!("Cloning: {} {}", &rp.0.to_string(), &rp.1.to_str().unwrap());
     let cmd: std::process::Child = Command::new("git")
         .env(ENV_GIT_USERNAME, gu.as_str())
         .env(ENV_GIT_PASSWORD, gp.as_str())
@@ -184,6 +192,8 @@ async fn git_clone(rp: (Url, PathBuf), gu: Arc<String>, gp: Arc<String>, sa: Arc
         .env(ENV_GIT_ASKPASS, sa.as_str())
         .arg("clone")
         .arg("--recursive")
+        .arg(format!("{}", rp.0))
+        .arg(rp.1)
         .stdout(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -220,8 +230,9 @@ fn control_process(cmd: std::process::Child, repo: &str, mode: GitMode) {
     let time_sleep = time::Duration::from_secs(10);
     thread::sleep(time_sleep);
 
-    let read_stdout = BufReader::new(cmd.stdout.expect("Failed to get stdout"));
-    let read_stderr = BufReader::new(cmd.stderr.expect("Failed to get stderr"));
+    // Updated case where stdout/stderr is failed to be buffered
+    let read_stdout = BufReader::new(cmd.stdout.unwrap()); //.expect("Failed to get stdout"));
+    let read_stderr = BufReader::new(cmd.stderr.unwrap()); //.expect("Failed to get stderr"));
 
     let mut out: Vec<String> = read_stdout
         .lines()
@@ -267,14 +278,8 @@ fn read_repo_lists(sd: &PathBuf, fl: Vec<PathBuf>) -> Vec<(Url, PathBuf)> {
     for f in fl {
         if f.exists() {
             let ext = f.extension().unwrap_or(OsStr::new(""));
-            if ext == "txt" || ext == "" {
-                if let Some(li) = read_list_txt(sd, f) {
-                    url_vs_folder.extend(li);
-                }
-            } else if ext == "csv" {
-                if let Some(li) = read_list_csv(sd, f) {
-                    url_vs_folder.extend(li);
-                }
+            if let Some(li) = read_lists(sd, &f, &ext) {
+                url_vs_folder.extend(li);
             }
         }
     }
@@ -282,115 +287,97 @@ fn read_repo_lists(sd: &PathBuf, fl: Vec<PathBuf>) -> Vec<(Url, PathBuf)> {
     url_vs_folder
 }
 
-fn read_list_txt(sd: &PathBuf, txt: PathBuf) -> Option<Vec<(Url, PathBuf)>> {
+fn read_lists(sd: &PathBuf, txt: &PathBuf, ext: &OsStr) -> Option<Vec<(Url, PathBuf)>> {
     let repo_path = sd.clone();
+
     let file = match File::open(&txt) {
         Ok(fi) => fi,
         Err(e) => {
-            error!("Could not read: {:#?} {}", &txt, e);
+            error!("Could not read: {} {}", &txt.to_str().unwrap(), e);
             return None;
         }
     };
 
-    let reader = BufReader::new(file);
-    let lines = reader.lines();
-    let mut url_vs_folder = Vec::<(Url, PathBuf)>::with_capacity(512);
+    let mut url_vs_folder = Vec::<(Url, PathBuf)>::with_capacity(4096);
 
-    for line in lines {
-        let l = match line {
-            Ok(li) => li,
-            Err(e) => {
-                warn!("Could not parse line in txt file: {}", e);
-                continue;
-            }
-        };
+    if ext == "txt" || ext == "" {
+        let reader = BufReader::new(file);
+        let lines: Vec<String> = reader
+            .lines()
+            .map(|l| l.unwrap_or("".to_string()))
+            .collect();
 
-        let url: Url = match Url::parse(&l) {
-            Ok(u) => u,
-            Err(e) => {
-                warn!("Could not parse url: {}", e);
-                continue;
-            }
-        };
+        for l in lines.into_iter() {
+            let url: Url = match Url::parse(&l) {
+                Ok(u) => u,
+                Err(e) => {
+                    warn!("Could not parse url: {} {}", l, e);
+                    continue;
+                }
+            };
 
-        let mut cwd = repo_path.clone();
-        let url_segments: Vec<&str> = url.path().split('/').collect();
-        // https://some.site.com/author/repository - basically 2 segments are
-        // present, but there can be other cases, then path will be longer
-        cwd.extend(url_segments.into_iter());
+            let mut cwd = repo_path.clone();
+            let url_segments: Vec<&str> = url.path().split('/').collect();
+            // https://some.site.com/author/repository - basically 2 segments are
+            // present, but there can be other cases, then path will be longer
+            cwd.extend(url_segments.into_iter());
 
-        url_vs_folder.push((url, cwd));
-    }
-
-    if url_vs_folder.len() > 0 {
-        Some(url_vs_folder)
-    } else {
-        None
-    }
-}
-
-fn read_list_csv(sd: &PathBuf, csv: PathBuf) -> Option<Vec<(Url, PathBuf)>> {
-    let repo_path = sd.clone();
-    let file = match File::open(&csv) {
-        Ok(fi) => fi,
-        Err(e) => {
-            error!("Could not read: {:#?} {}", &csv, e);
-            return None;
+            url_vs_folder.push((url, cwd));
         }
-    };
-
-    let mut reader = ReaderBuilder::new().has_headers(true).from_reader(file);
-
-    let headers = match reader.headers() {
-        Ok(hs) => hs,
-        Err(e) => {
-            warn!("Could not get header from csv: {}", e);
-            return None;
-        }
-    };
-
-    // There is possibility url entries won't be found, but csv file will be
-    // read anyway, maybe it's better to check "repository" or any other
-    // record is in header
-    let repo_pos = headers
-        .iter()
-        .position(|he| he.to_string() == "repository".to_string())
-        .unwrap_or_default();
-
-    let mut url_vs_folder = Vec::<(Url, PathBuf)>::with_capacity(512);
-    for rec in reader.into_records() {
-        let r = match rec {
-            Ok(re) => re,
+    } else if ext == "csv" {
+        let mut reader = ReaderBuilder::new().has_headers(true).from_reader(file);
+        let headers = match reader.headers() {
+            Ok(hs) => hs,
             Err(e) => {
-                warn!("Could not get record: {}", e);
-                continue;
+                warn!("Could not get header from csv: {}", e);
+                return None;
             }
         };
-        if r.is_empty() {
-            continue;
+
+        // There is possibility url entries won't be found, but csv file will be
+        // read anyway, maybe it's better to check "repository" or any other
+        // record is in header
+        let repo_pos = headers
+            .iter()
+            .position(|he| he.to_string() == "repository".to_string())
+            .unwrap_or_default();
+
+        let mut url_vs_folder = Vec::<(Url, PathBuf)>::with_capacity(512);
+        for rec in reader.into_records() {
+            let r = match rec {
+                Ok(re) => re,
+                Err(e) => {
+                    warn!("Could not get record: {}", e);
+                    continue;
+                }
+            };
+            if r.is_empty() {
+                continue;
+            }
+
+            let repo = match r.get(repo_pos) {
+                Some(re) => re,
+                None => {
+                    warn!("Could not get record element");
+                    continue;
+                }
+            };
+
+            let url: Url = match Url::parse(repo) {
+                Ok(ur) => ur,
+                Err(e) => {
+                    warn!("Could not parse url: {} {}", repo, e);
+                    continue;
+                }
+            };
+
+            let mut cwd = repo_path.clone();
+            let url_segments: Vec<&str> = url.path().split('/').collect();
+            // See read_list_txt
+            cwd.extend(url_segments.into_iter());
+
+            url_vs_folder.push((url, cwd));
         }
-        let repo = match r.get(repo_pos) {
-            Some(re) => re,
-            None => {
-                warn!("Could not get record element");
-                continue;
-            }
-        };
-
-        let url: Url = match Url::parse(repo) {
-            Ok(ur) => ur,
-            Err(e) => {
-                warn!("Could not parse url: {}", e);
-                continue;
-            }
-        };
-
-        let mut cwd = repo_path.clone();
-        let url_segments: Vec<&str> = url.path().split('/').collect();
-        // See read_list_txt
-        cwd.extend(url_segments.into_iter());
-
-        url_vs_folder.push((url, cwd));
     }
 
     if url_vs_folder.len() > 0 {
