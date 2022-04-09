@@ -4,12 +4,12 @@ use clap::{Arg, Command};
 use dl_upd::{download_repos, update_directories};
 use log::{error, info};
 use simple_logger::SimpleLogger;
-use tokio;
+use tokio::{self, runtime};
 
 const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+// #[tokio::main]
+fn main() {
     SimpleLogger::new().init().unwrap();
     let m = Command::new("freshgit - git repositories downloader and updater")
         .author("flakusha, zenflak@gmail.com")
@@ -50,19 +50,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .get_matches();
 
-    info!("Checking for subcommands");
+    info!("Checking for subcommands, building runtime");
+    // Runtime with hardcoded thread number
+    let rt = runtime::Builder::new_multi_thread()
+        .worker_threads(64)
+        .max_blocking_threads(64)
+        .enable_all()
+        .build()
+        .unwrap();
+
     match m.subcommand() {
         Some(("update", _upd)) => {
             info!("Starting repositories update");
-            update_directories(&m).await;
+            let _res = rt.spawn(async move {
+                update_directories(&m).await;
+            });
         }
         Some(("download", _dwl)) => {
             info!("Starting repositories download");
-            download_repos(&m).await;
+            let _res = rt.spawn(async move {
+                download_repos(&m).await;
+            });
         }
-        _ => error!("Incorrect configuration and flags provided"),
+        _ => {
+            error!("Incorrect config is provided");
+            let _res = rt.spawn(async move {});
+        }
     }
-
-    info!("Finished successfully");
-    Ok(())
 }

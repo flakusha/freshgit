@@ -1,17 +1,18 @@
 use crate::dl_upd::Config;
 use csv::ReaderBuilder;
 use lazy_static::lazy_static;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::BufRead;
 use std::path::PathBuf;
-use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::{thread, time};
+// use std::{thread, time};
 use tokio;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
 use url::Url;
 use walkdir::WalkDir;
 
@@ -181,11 +182,10 @@ async fn git_clone(rp: (Url, PathBuf), gu: Arc<String>, gp: Arc<String>, sa: Arc
             "Repository is already cloned, use update instead: {}",
             rp.1.to_str().unwrap_or("error unwrapping")
         );
-        return;
     }
 
     info!("Cloning: {} {}", &rp.0.to_string(), &rp.1.to_str().unwrap());
-    let cmd: std::process::Child = Command::new("git")
+    let cmd: tokio::process::Child = Command::new("git")
         .env(ENV_GIT_USERNAME, gu.as_str())
         .env(ENV_GIT_PASSWORD, gp.as_str())
         .env(ENV_SSH_ASKPASS, sa.as_str())
@@ -199,15 +199,20 @@ async fn git_clone(rp: (Url, PathBuf), gu: Arc<String>, gp: Arc<String>, sa: Arc
         .spawn()
         .expect("Failed to execute child");
 
-    control_process(cmd, rp.0.as_str(), GitMode::CLONE);
+    let _res = control_process(cmd, rp.0.as_str(), GitMode::CLONE).await;
 }
 
 async fn git_fetch(cd: PathBuf, gu: Arc<String>, gp: Arc<String>, sa: Arc<String>) {
+    if cd.exists() && cd.is_dir() {
+        info!("Updating: {}", cd.to_string_lossy());
+    } else {
+        return;
+    }
+
     // Move out the .git folder
     cd.clone().pop();
 
-    info!("Updating: {}", cd.to_string_lossy());
-    let cmd: std::process::Child = Command::new("git")
+    let cmd: tokio::process::Child = Command::new("git")
         .current_dir(&cd)
         .env(ENV_GIT_USERNAME, gu.as_str())
         .env(ENV_GIT_PASSWORD, gp.as_str())
@@ -222,31 +227,36 @@ async fn git_fetch(cd: PathBuf, gu: Arc<String>, gp: Arc<String>, sa: Arc<String
         .spawn()
         .expect("Failed to execute child");
 
-    control_process(cmd, cd.to_str().unwrap_or(""), GitMode::FETCH);
+    // No, I'm not going to use it
+    let _res = control_process(cmd, cd.to_str().unwrap_or(""), GitMode::FETCH).await;
 }
 
-fn control_process(cmd: std::process::Child, repo: &str, mode: GitMode) {
-    let pid = cmd.id();
-    let time_sleep = time::Duration::from_secs(10);
-    thread::sleep(time_sleep);
+async fn control_process(
+    mut cmd: tokio::process::Child,
+    repo: &str,
+    mode: GitMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pid = cmd.id().unwrap();
+    let stdout = cmd.stdout.take().expect("no stdout");
+    let reader = BufReader::new(stdout);
 
-    // Updated case where stdout/stderr is failed to be buffered
-    let read_stdout = BufReader::new(cmd.stdout.unwrap()); //.expect("Failed to get stdout"));
-    let read_stderr = BufReader::new(cmd.stderr.unwrap()); //.expect("Failed to get stderr"));
+    tokio::task::spawn(async move {
+        let status = cmd.wait().await.expect("Process failed");
+        info!("Finished process: {}", status);
+    });
 
-    let mut out: Vec<String> = read_stdout
-        .lines()
-        .map(|l| l.unwrap_or("".to_string()))
-        .collect();
-    let err: Vec<String> = read_stderr
-        .lines()
-        .map(|l| l.unwrap_or("".to_string()))
-        .collect();
+    check_stdout(pid, reader, &mode, repo).await
+}
 
-    out.extend(err);
-
-    for l in out {
-        info!("Git output: {}: {}", &repo, l.replace('\n', "  "));
+async fn check_stdout(
+    pid: u32,
+    reader: BufReader<tokio::process::ChildStdout>,
+    mode: &GitMode,
+    repo: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut reader = reader.lines();
+    while let Some(l) = reader.next_line().await? {
+        debug!("Stdout: {}", l);
         if HashSet::from_iter(l.split([' ', ':']))
             .intersection(&GIT_OUT)
             .count()
@@ -260,16 +270,14 @@ fn control_process(cmd: std::process::Child, repo: &str, mode: GitMode) {
                     warn!("Problem cloning: {}", &repo);
                 }
             }
+
             // Kill the process
             let _kill = Command::new("kill").arg("-9").arg(pid.to_string()).output();
-            return;
+            info!("Killed process: {}", pid);
         }
     }
 
-    match &mode {
-        GitMode::FETCH => {}
-        GitMode::CLONE => {}
-    }
+    Ok(())
 }
 
 fn read_repo_lists(sd: &PathBuf, fl: Vec<PathBuf>) -> Vec<(Url, PathBuf)> {
@@ -301,13 +309,14 @@ fn read_lists(sd: &PathBuf, txt: &PathBuf, ext: &OsStr) -> Option<Vec<(Url, Path
     let mut url_vs_folder = Vec::<(Url, PathBuf)>::with_capacity(4096);
 
     if ext == "txt" || ext == "" {
-        let reader = BufReader::new(file);
+        let reader = std::io::BufReader::new(file);
         let lines: Vec<String> = reader
             .lines()
             .map(|l| l.unwrap_or("".to_string()))
             .collect();
 
         for l in lines.into_iter() {
+            debug!("String URL (txt): {}", l);
             let url: Url = match Url::parse(&l) {
                 Ok(u) => u,
                 Err(e) => {
@@ -363,6 +372,7 @@ fn read_lists(sd: &PathBuf, txt: &PathBuf, ext: &OsStr) -> Option<Vec<(Url, Path
                 }
             };
 
+            debug!("String URL (csv): {}", repo);
             let url: Url = match Url::parse(repo) {
                 Ok(ur) => ur,
                 Err(e) => {
