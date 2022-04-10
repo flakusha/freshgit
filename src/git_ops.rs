@@ -10,9 +10,9 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 // use std::{thread, time};
-use tokio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::{self, runtime};
 use url::Url;
 use walkdir::WalkDir;
 
@@ -55,7 +55,7 @@ pub enum GitMode {
     CLONE,
 }
 
-pub async fn git_config_and_run(conf: Config, mode: GitMode) {
+pub fn git_config_and_run(conf: Config, mode: GitMode) {
     let src_folder = conf.src_folder.unwrap_or(PathBuf::new());
     let files_to_read = conf.files_to_read.unwrap_or(Vec::<PathBuf>::new());
     let git_username = conf.git_username.unwrap_or("git".to_string());
@@ -108,7 +108,7 @@ pub async fn git_config_and_run(conf: Config, mode: GitMode) {
 
             let repos = read_repo_lists(&src_folder, files_to_read);
 
-            clone_repos(git_username, git_password, ssh_askpass, async_exec, repos).await;
+            clone_repos(git_username, git_password, ssh_askpass, async_exec, repos);
         }
         GitMode::FETCH => {
             walk_fetch(
@@ -117,19 +117,39 @@ pub async fn git_config_and_run(conf: Config, mode: GitMode) {
                 git_password,
                 ssh_askpass,
                 async_exec,
-            )
-            .await;
+            );
         }
     }
 }
 
-async fn walk_fetch(
-    src_folder: PathBuf,
-    gu: Arc<String>,
-    gp: Arc<String>,
-    sa: Arc<String>,
-    ae: bool,
-) {
+fn walk_fetch(src_folder: PathBuf, gu: Arc<String>, gp: Arc<String>, sa: Arc<String>, ae: bool) {
+    let rt = match ae {
+        true => runtime::Builder::new_multi_thread()
+            .worker_threads(16)
+            .max_blocking_threads(16)
+            .thread_name("tokio-runtime-git-fetch-multi")
+            .on_thread_start(|| {
+                info!("Fetch runtime started");
+            })
+            .on_thread_stop(|| {
+                info!("Fetch runtime finished working");
+            })
+            .enable_all()
+            .build()
+            .unwrap(),
+        false => runtime::Builder::new_current_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .thread_name("tokio-runtime-git-fetch-current")
+            .on_thread_start(|| info!("Fetch single thread runtime started"))
+            .on_thread_stop(|| info!("Fetch single thread runtime finished working"))
+            .enable_all()
+            .build()
+            .unwrap(),
+    };
+
+    // let handle = rt.handle();
+
     for f in WalkDir::new(src_folder).into_iter() {
         match f {
             Ok(fl) => {
@@ -140,10 +160,12 @@ async fn walk_fetch(
                         let sa = sa.clone();
 
                         if !ae {
-                            git_fetch(fl.into_path(), gu, gp, sa).await;
-                        } else {
-                            tokio::task::spawn(async move {
+                            rt.block_on(async {
                                 git_fetch(fl.into_path(), gu, gp, sa).await;
+                            })
+                        } else {
+                            let jh = rt.spawn(async {
+                                tokio::task::spawn(git_fetch(fl.into_path(), gu, gp, sa));
                             });
                         }
                     };
@@ -154,23 +176,52 @@ async fn walk_fetch(
     }
 }
 
-async fn clone_repos(
+fn clone_repos(
     gu: Arc<String>,
     gp: Arc<String>,
     sa: Arc<String>,
     ae: bool,
     rp: Vec<(Url, PathBuf)>,
 ) {
+    let rt = match ae {
+        true => runtime::Builder::new_multi_thread()
+            .worker_threads(16)
+            .max_blocking_threads(16)
+            .thread_name("tokio-runtime-git-fetch-multi")
+            .on_thread_start(|| {
+                info!("Fetch runtime started");
+            })
+            .on_thread_stop(|| {
+                info!("Fetch runtime finished working");
+            })
+            .enable_all()
+            .build()
+            .unwrap(),
+        false => runtime::Builder::new_current_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .thread_name("tokio-runtime-git-fetch-current")
+            .on_thread_start(|| info!("Fetch single thread runtime started"))
+            .on_thread_stop(|| info!("Fetch single thread runtime finished working"))
+            .enable_all()
+            .build()
+            .unwrap(),
+    };
+
     for repo in rp {
         let gu = gu.clone();
         let gp = gp.clone();
         let sa = sa.clone();
 
         if !ae {
-            git_clone(repo, gu, gp, sa).await;
-        } else {
-            tokio::task::spawn(async move {
+            rt.block_on(async {
                 git_clone(repo, gu, gp, sa).await;
+            })
+        } else {
+            let jh = rt.spawn(async {
+                tokio::task::spawn(async move {
+                    git_clone(repo, gu, gp, sa).await;
+                })
             });
         }
     }
@@ -182,6 +233,7 @@ async fn git_clone(rp: (Url, PathBuf), gu: Arc<String>, gp: Arc<String>, sa: Arc
             "Repository is already cloned, use update instead: {}",
             rp.1.to_str().unwrap_or("error unwrapping")
         );
+        return;
     }
 
     info!("Cloning: {} {}", &rp.0.to_string(), &rp.1.to_str().unwrap());

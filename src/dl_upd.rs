@@ -36,19 +36,19 @@ const SPASS: &str = "SSH askpass:";
 const AEXEC: &str = "Async execution:";
 
 /// Passes actual config data to update/fetch function.
-pub async fn update_directories(matches: &ArgMatches) {
-    update_config(matches);
+pub fn update_directories(matches: ArgMatches) {
+    update_config(&matches);
     let conf = get_config();
     info!("Configuration: {}", conf);
-    git_config_and_run(conf, GitMode::FETCH).await;
+    git_config_and_run(conf, GitMode::FETCH);
 }
 
 /// Passes actual config data to download/clone function.
-pub async fn download_repos(matches: &ArgMatches) {
-    update_config(matches);
+pub fn download_repos(matches: ArgMatches) {
+    update_config(&matches);
     let conf = get_config();
     info!("Configuration: {}", conf);
-    git_config_and_run(conf, GitMode::CLONE).await;
+    git_config_and_run(conf, GitMode::CLONE);
 }
 
 #[derive(Deserialize, Clone, Debug)]
