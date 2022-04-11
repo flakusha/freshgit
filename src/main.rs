@@ -48,14 +48,7 @@ fn main() {
         )
         .get_matches();
 
-    info!("Checking for subcommands, building runtime");
-    // Runtime with hardcoded thread number
-    // let rt = runtime::Builder::new_multi_thread()
-    //     .worker_threads(4)
-    //     .max_blocking_threads(4)
-    //     .enable_all()
-    //     .build()
-    //     .unwrap();
+    info!("Checking subcommands");
 
     match m.subcommand() {
         Some(("update", _upd)) => {

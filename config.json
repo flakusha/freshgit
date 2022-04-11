@@ -1,8 +1,8 @@
 {
   "files_to_read": [],
   "src_folder": "",
-  "git_username": "",
+  "git_username": "git",
   "git_password": "",
   "ssh_askpass": "",
-  "tasks": 16
+  "async_exec": true
 }

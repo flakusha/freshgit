@@ -9,7 +9,9 @@ use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use tokio::task::JoinHandle;
 // use std::{thread, time};
+use futures::future::join_all;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::{self, runtime};
@@ -148,7 +150,7 @@ fn walk_fetch(src_folder: PathBuf, gu: Arc<String>, gp: Arc<String>, sa: Arc<Str
             .unwrap(),
     };
 
-    // let handle = rt.handle();
+    let mut jhs: Vec<JoinHandle<_>> = vec![];
 
     for f in WalkDir::new(src_folder).into_iter() {
         match f {
@@ -167,12 +169,19 @@ fn walk_fetch(src_folder: PathBuf, gu: Arc<String>, gp: Arc<String>, sa: Arc<Str
                             let jh = rt.spawn(async {
                                 tokio::task::spawn(git_fetch(fl.into_path(), gu, gp, sa));
                             });
+                            jhs.push(jh);
                         }
                     };
                 }
             }
             Err(e) => error!("{}: {}", WALKDIR_ERR, e),
         }
+    }
+
+    if jhs.len() > 0 {
+        rt.block_on(async {
+            join_all(jhs).await;
+        })
     }
 }
 
@@ -208,6 +217,8 @@ fn clone_repos(
             .unwrap(),
     };
 
+    let mut jhs: Vec<JoinHandle<_>> = vec![];
+
     for repo in rp {
         let gu = gu.clone();
         let gp = gp.clone();
@@ -219,11 +230,16 @@ fn clone_repos(
             })
         } else {
             let jh = rt.spawn(async {
-                tokio::task::spawn(async move {
-                    git_clone(repo, gu, gp, sa).await;
-                })
+                tokio::task::spawn(git_clone(repo, gu, gp, sa));
             });
+            jhs.push(jh);
         }
+    }
+
+    if jhs.len() > 0 {
+        rt.block_on(async {
+            join_all(jhs).await;
+        })
     }
 }
 
