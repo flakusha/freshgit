@@ -1,4 +1,4 @@
-#freshgit - git repositories downloader and updater
+# freshgit - git repositories downloader and updater
 
 This is application in Rust to keep your repositories locally and update them
 using configuration file.
