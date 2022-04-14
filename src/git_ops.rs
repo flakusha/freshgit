@@ -1,5 +1,6 @@
 use crate::dl_upd::Config;
 use csv::ReaderBuilder;
+use futures::future::join_all;
 use lazy_static::lazy_static;
 use log::{debug, error, info, warn};
 use std::collections::HashSet;
@@ -9,11 +10,9 @@ use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::task::JoinHandle;
-// use std::{thread, time};
-use futures::future::join_all;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::task::JoinHandle;
 use tokio::{self, runtime};
 use url::Url;
 use walkdir::WalkDir;
@@ -124,11 +123,11 @@ pub fn git_config_and_run(conf: Config, mode: GitMode) {
     }
 }
 
-fn walk_fetch(src_folder: PathBuf, gu: Arc<String>, gp: Arc<String>, sa: Arc<String>, ae: bool) {
-    let rt = match ae {
+fn create_tokio_runtime(ae: bool) -> runtime::Runtime {
+    match ae {
         true => runtime::Builder::new_multi_thread()
-            .worker_threads(16)
-            .max_blocking_threads(16)
+            .worker_threads(32)
+            .max_blocking_threads(32)
             .thread_name("tokio-runtime-git-fetch-multi")
             .on_thread_start(|| {
                 info!("Fetch runtime started");
@@ -148,8 +147,11 @@ fn walk_fetch(src_folder: PathBuf, gu: Arc<String>, gp: Arc<String>, sa: Arc<Str
             .enable_all()
             .build()
             .unwrap(),
-    };
+    }
+}
 
+fn walk_fetch(src_folder: PathBuf, gu: Arc<String>, gp: Arc<String>, sa: Arc<String>, ae: bool) {
+    let rt = create_tokio_runtime(ae);
     let mut jhs: Vec<JoinHandle<_>> = vec![];
 
     for f in WalkDir::new(src_folder).into_iter() {
@@ -192,31 +194,7 @@ fn clone_repos(
     ae: bool,
     rp: Vec<(Url, PathBuf)>,
 ) {
-    let rt = match ae {
-        true => runtime::Builder::new_multi_thread()
-            .worker_threads(16)
-            .max_blocking_threads(16)
-            .thread_name("tokio-runtime-git-fetch-multi")
-            .on_thread_start(|| {
-                info!("Fetch runtime started");
-            })
-            .on_thread_stop(|| {
-                info!("Fetch runtime finished working");
-            })
-            .enable_all()
-            .build()
-            .unwrap(),
-        false => runtime::Builder::new_current_thread()
-            .worker_threads(1)
-            .max_blocking_threads(1)
-            .thread_name("tokio-runtime-git-fetch-current")
-            .on_thread_start(|| info!("Fetch single thread runtime started"))
-            .on_thread_stop(|| info!("Fetch single thread runtime finished working"))
-            .enable_all()
-            .build()
-            .unwrap(),
-    };
-
+    let rt = create_tokio_runtime(ae);
     let mut jhs: Vec<JoinHandle<_>> = vec![];
 
     for repo in rp {
@@ -305,30 +283,39 @@ async fn control_process(
     mode: GitMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let pid = cmd.id().unwrap();
-    let stdout = cmd.stdout.take().expect("no stdout");
-    let reader = BufReader::new(stdout);
+    let stdout = cmd.stdout.take().unwrap(); // don't want to panic here
+    let stderr = cmd.stderr.take().unwrap(); // don't want to panic here
+    let reader_out = BufReader::new(stdout);
+    let reader_err = BufReader::new(stderr);
 
     tokio::task::spawn(async move {
         let status = cmd.wait().await.expect("Process failed");
         info!("Finished process: {}", status);
     });
 
-    check_stdout(pid, reader, &mode, repo).await
+    check_process(pid, reader_out, reader_err, &mode, repo).await
 }
 
-async fn check_stdout(
+async fn check_process(
     pid: u32,
-    reader: BufReader<tokio::process::ChildStdout>,
+    reader_out: BufReader<tokio::process::ChildStdout>,
+    reader_err: BufReader<tokio::process::ChildStderr>,
     mode: &GitMode,
     repo: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut reader = reader.lines();
-    while let Some(l) = reader.next_line().await? {
-        debug!("Stdout: {}", l);
-        if HashSet::from_iter(l.split([' ', ':']))
+    let mut reader_o = reader_out.lines();
+    let mut reader_e = reader_err.lines();
+
+    while let (Some(o), Some(e)) = (reader_o.next_line().await?, reader_e.next_line().await?) {
+        debug!("Stdout: {}; Stderr: {}", o, e);
+        if HashSet::from_iter(o.split([' ', ':']))
             .intersection(&GIT_OUT)
             .count()
             > 0
+            || HashSet::from_iter(e.split([' ', ':']))
+                .intersection(&GIT_OUT)
+                .count()
+                > 0
         {
             match &mode {
                 GitMode::FETCH => {
@@ -394,9 +381,17 @@ fn read_lists(sd: &PathBuf, txt: &PathBuf, ext: &OsStr) -> Option<Vec<(Url, Path
             };
 
             let mut cwd = repo_path.clone();
-            let url_segments: Vec<&str> = url.path().split('/').collect();
             // https://some.site.com/author/repository - basically 2 segments are
             // present, but there can be other cases, then path will be longer
+            let mut url_segments: Vec<String> =
+                url.path().split('/').map(|i| i.to_string()).collect();
+            let idx_last = url_segments.len() - 1;
+            // Cut ".git" from the end of path
+            if url_segments.get(idx_last).unwrap().ends_with(".git") {
+                url_segments[idx_last] =
+                    url_segments.get_mut(idx_last).unwrap().replace(".git", "");
+            }
+
             cwd.extend(url_segments.into_iter());
 
             url_vs_folder.push((url, cwd));
@@ -450,7 +445,13 @@ fn read_lists(sd: &PathBuf, txt: &PathBuf, ext: &OsStr) -> Option<Vec<(Url, Path
             };
 
             let mut cwd = repo_path.clone();
-            let url_segments: Vec<&str> = url.path().split('/').collect();
+            let mut url_segments: Vec<String> =
+                url.path().split('/').map(|i| i.to_string()).collect();
+            let idx_last = url_segments.len() - 1;
+            // Cut ".git" from the end of path
+            if url_segments.get(idx_last).unwrap().ends_with(".git") {
+                url_segments[idx_last] = url_segments.get(idx_last).unwrap().replace(".git", "");
+            }
             // See read_list_txt
             cwd.extend(url_segments.into_iter());
 
