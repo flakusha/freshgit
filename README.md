@@ -1,6 +1,6 @@
 # freshgit - git repositories downloader and updater
 
-This is application in Rust to keep your repositories locally and update them
+This is application is designed keep your repositories locally and update them
 using configuration file.
 
 My aim is to test out tokio and futures for this purpose and achieve better

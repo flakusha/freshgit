@@ -1,3 +1,6 @@
+//! # freshgit - git repositories downloader and updater.
+//!
+//! This application is designed to download and update selected repositories locally.
 mod dl_upd;
 mod git_ops;
 use clap::{Arg, Command};

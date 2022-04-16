@@ -1,8 +1,13 @@
+//! This is the main module responsible for cloning and fetching repositories.
+//! Overall scenario is to accept configuration, check it and then run
+//! corresponding process. While process is running, it's stdout and stderr are
+//! captured to check if transaction is possible and if it's not there is an
+//! attempt to kill process to free the runtime slot for new process.
 use crate::dl_upd::Config;
 use csv::ReaderBuilder;
 use futures::future::join_all;
 use lazy_static::lazy_static;
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::File;
@@ -56,6 +61,8 @@ pub enum GitMode {
     CLONE,
 }
 
+/// Checks passed configuration and also sets sane defaults before running clone
+/// or getch processes.
 pub fn git_config_and_run(conf: Config, mode: GitMode) {
     let src_folder = conf.src_folder.unwrap_or(PathBuf::new());
     let files_to_read = conf.files_to_read.unwrap_or(Vec::<PathBuf>::new());
@@ -123,6 +130,7 @@ pub fn git_config_and_run(conf: Config, mode: GitMode) {
     }
 }
 
+/// Creates custom tokio runtime for sync and async execution.
 fn create_tokio_runtime(ae: bool) -> runtime::Runtime {
     match ae {
         true => runtime::Builder::new_multi_thread()
@@ -130,10 +138,10 @@ fn create_tokio_runtime(ae: bool) -> runtime::Runtime {
             .max_blocking_threads(32)
             .thread_name("tokio-runtime-git-fetch-multi")
             .on_thread_start(|| {
-                info!("Fetch runtime started");
+                info!("Runtime started");
             })
             .on_thread_stop(|| {
-                info!("Fetch runtime finished working");
+                info!("Runtime finished working");
             })
             .enable_all()
             .build()
@@ -142,14 +150,16 @@ fn create_tokio_runtime(ae: bool) -> runtime::Runtime {
             .worker_threads(1)
             .max_blocking_threads(1)
             .thread_name("tokio-runtime-git-fetch-current")
-            .on_thread_start(|| info!("Fetch single thread runtime started"))
-            .on_thread_stop(|| info!("Fetch single thread runtime finished working"))
+            .on_thread_start(|| info!("Single thread runtime started"))
+            .on_thread_stop(|| info!("Single thread runtime finished working"))
             .enable_all()
             .build()
             .unwrap(),
     }
 }
 
+/// Walks all the folders in provided root folder and tries to check out changes if git repository
+/// is detected.
 fn walk_fetch(src_folder: PathBuf, gu: Arc<String>, gp: Arc<String>, sa: Arc<String>, ae: bool) {
     let rt = create_tokio_runtime(ae);
     let mut jhs: Vec<JoinHandle<_>> = vec![];
@@ -187,6 +197,7 @@ fn walk_fetch(src_folder: PathBuf, gu: Arc<String>, gp: Arc<String>, sa: Arc<Str
     }
 }
 
+/// Clones provided repositories using sync or async tokio runtimes.
 fn clone_repos(
     gu: Arc<String>,
     gp: Arc<String>,
@@ -221,6 +232,7 @@ fn clone_repos(
     }
 }
 
+/// Clones provided repository using tokio::process::Command.
 async fn git_clone(rp: (Url, PathBuf), gu: Arc<String>, gp: Arc<String>, sa: Arc<String>) {
     if rp.1.exists() && rp.1.is_dir() {
         info!(
@@ -248,6 +260,7 @@ async fn git_clone(rp: (Url, PathBuf), gu: Arc<String>, gp: Arc<String>, sa: Arc
     let _res = control_process(cmd, rp.0.as_str(), GitMode::CLONE).await;
 }
 
+/// Fetches detected repository using tokio::process::Command.
 async fn git_fetch(cd: PathBuf, gu: Arc<String>, gp: Arc<String>, sa: Arc<String>) {
     if cd.exists() && cd.is_dir() {
         info!("Updating: {}", cd.to_string_lossy());
@@ -277,14 +290,18 @@ async fn git_fetch(cd: PathBuf, gu: Arc<String>, gp: Arc<String>, sa: Arc<String
     let _res = control_process(cmd, cd.to_str().unwrap_or(""), GitMode::FETCH).await;
 }
 
+/// Tries to get stdout and stderr from running process and then checks them for
+/// clone or fetch failure to kill process and do not wait for user input
+/// this is usually needed when user password is incorrect, not accepted or
+/// repository does not exist at all, or cannot answer.
 async fn control_process(
     mut cmd: tokio::process::Child,
     repo: &str,
     mode: GitMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let pid = cmd.id().unwrap();
-    let stdout = cmd.stdout.take().unwrap(); // don't want to panic here
-    let stderr = cmd.stderr.take().unwrap(); // don't want to panic here
+    let stdout = cmd.stdout.take().expect("no stdout");
+    let stderr = cmd.stderr.take().expect("no stderr");
     let reader_out = BufReader::new(stdout);
     let reader_err = BufReader::new(stderr);
 
@@ -296,6 +313,8 @@ async fn control_process(
     check_process(pid, reader_out, reader_err, &mode, repo).await
 }
 
+/// Continuously parses stdout and stderr from the Command to detect if it is
+/// running correctly, otherwise sends kill -9 for this pid.
 async fn check_process(
     pid: u32,
     reader_out: BufReader<tokio::process::ChildStdout>,
@@ -307,7 +326,7 @@ async fn check_process(
     let mut reader_e = reader_err.lines();
 
     while let (Some(o), Some(e)) = (reader_o.next_line().await?, reader_e.next_line().await?) {
-        debug!("Stdout: {}; Stderr: {}", o, e);
+        // debug!("Stdout: {}; Stderr: {}", o, e);
         if HashSet::from_iter(o.split([' ', ':']))
             .intersection(&GIT_OUT)
             .count()
@@ -335,6 +354,8 @@ async fn check_process(
     Ok(())
 }
 
+/// Reads repo lists from provided files. Text files with repository on every line and
+/// csv file with "repositories" column are supported at the moment.
 fn read_repo_lists(sd: &PathBuf, fl: Vec<PathBuf>) -> Vec<(Url, PathBuf)> {
     let mut url_vs_folder = Vec::<(Url, PathBuf)>::with_capacity(2048);
 
@@ -350,6 +371,8 @@ fn read_repo_lists(sd: &PathBuf, fl: Vec<PathBuf>) -> Vec<(Url, PathBuf)> {
     url_vs_folder
 }
 
+/// Reads provided text file and converts every supported entry to pair of
+/// (Entry_URL, Folder_Addr) pushed into Vec.
 fn read_lists(sd: &PathBuf, txt: &PathBuf, ext: &OsStr) -> Option<Vec<(Url, PathBuf)>> {
     let repo_path = sd.clone();
 
@@ -371,7 +394,7 @@ fn read_lists(sd: &PathBuf, txt: &PathBuf, ext: &OsStr) -> Option<Vec<(Url, Path
             .collect();
 
         for l in lines.into_iter() {
-            debug!("String URL (txt): {}", l);
+            // debug!("String URL (txt): {}", l);
             let url: Url = match Url::parse(&l) {
                 Ok(u) => u,
                 Err(e) => {
@@ -435,7 +458,7 @@ fn read_lists(sd: &PathBuf, txt: &PathBuf, ext: &OsStr) -> Option<Vec<(Url, Path
                 }
             };
 
-            debug!("String URL (csv): {}", repo);
+            // debug!("String URL (csv): {}", repo);
             let url: Url = match Url::parse(repo) {
                 Ok(ur) => ur,
                 Err(e) => {

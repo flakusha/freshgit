@@ -5,7 +5,7 @@ use crate::git_ops::{git_config_and_run, GitMode};
 use clap::ArgMatches;
 use core::fmt;
 use lazy_static::lazy_static;
-use log::{debug, error, info};
+use log::{error, info};
 use serde::Deserialize;
 use serde_json;
 use std::{
@@ -114,7 +114,7 @@ pub fn get_config() -> Config {
 }
 
 fn update_config(matches: &ArgMatches) {
-    debug!("Unlocking config");
+    // debug!("Unlocking config");
     let upd = &mut CONFIG.write().unwrap();
     upd.config_path = Some(PathBuf::from(matches.value_of("config").unwrap()));
     let uconf = read_config(matches);
